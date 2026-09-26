@@ -1,9 +1,15 @@
 import Fastify from 'fastify';
+import Ajv from 'ajv';
 import {
   planRanges,
   DEFAULT_MAX_SEGMENTS,
   DEFAULT_TRANSFER_SIZE_RATIO,
 } from './planner.js';
+import {
+  planResume,
+  MAX_COMPLETED_INTERVALS,
+  MAX_RESUME_REQUESTS,
+} from './resume.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -20,6 +26,44 @@ const planBodySchema = {
     lastModified: { type: 'string', minLength: 1, maxLength: 255 },
   },
 };
+
+const completedIntervalSchema = {
+  type: 'object',
+  required: ['start', 'end'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    end: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const resumePlanBodySchema = {
+  type: 'object',
+  required: ['size', 'completed', 'chunkBytes', 'limit'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    completed: {
+      type: 'array',
+      maxItems: MAX_COMPLETED_INTERVALS,
+      items: completedIntervalSchema,
+    },
+    chunkBytes: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+    limit: { type: 'integer', minimum: 1, maximum: MAX_RESUME_REQUESTS },
+  },
+};
+
+// Resume planning demands strict types: Fastify's default ajv setup coerces
+// scalar types and silently strips unknown properties, which would let a
+// string like "1000" pass as a byte count. This route therefore validates
+// with coercion and property removal disabled.
+const strictBodyAjv = new Ajv({
+  coerceTypes: false,
+  removeAdditional: false,
+  useDefaults: false,
+  allErrors: false,
+});
+const strictBodyValidatorCompiler = ({ schema }) => strictBodyAjv.compile(schema);
 
 const MAX_HEADER_LENGTH = 4096;
 const MAX_METADATA_LENGTH = { etag: 1024, lastModified: 255 };
@@ -77,6 +121,26 @@ export function buildApp(config = {}) {
 
     return reply.status(result.statusCode).send(result);
   });
+
+  // Resumable-download gap planning: POST /resume-plan with the persisted
+  // intervals in the JSON body; no Range header involved.
+  app.post(
+    '/resume-plan',
+    {
+      schema: { body: resumePlanBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = planResume({
+        size: request.body.size,
+        completed: request.body.completed,
+        chunkBytes: request.body.chunkBytes,
+        limit: request.body.limit,
+      });
+
+      return reply.status(result.statusCode).send(result);
+    },
+  );
 
   // Convenience endpoint so the API is probeable with a bare curl:
   //   curl 'http://localhost:3000/plan?size=1000' -H 'Range: bytes=0-99'

@@ -7,6 +7,9 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 一份“响应规划”——应当使用的 HTTP 状态码、响应头、每段的偏移/长度、每段头部，
 以及多段时确定性的 `multipart/byteranges` 边界和实际线上传输字节核算。
 
+另提供 `POST /resume-plan` 断点续传缺口规划接口：上报已持久化的字节区间，
+返回还需请求的 Range 分片清单（见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -124,6 +127,70 @@ curl -X POST http://localhost:3000/plan \
 curl 'http://localhost:3000/plan?size=10000&lastModified=Wednesday,%2021-Oct-15%2007:28:00%20GMT' \
   -H 'Range: bytes=0-99'
 ```
+
+### `POST /resume-plan`（断点续传缺口规划）
+
+面向断点续传场景：客户端上报**已持久化**的字节区间，服务先归并（乱序、
+重叠、相邻的区间都会合并），计算尚缺字节，再按偏移升序把缺口拆成不超过
+`chunkBytes` 的 Range 请求清单，最多返回 `limit` 条。全部参数在 JSON 体内，
+不涉及 `Range` 请求头。
+
+请求体：
+
+| 字段         | 类型    | 必填 | 说明                                                         |
+| ------------ | ------- | ---- | ------------------------------------------------------------ |
+| `size`       | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                             |
+| `completed`  | array   | 是   | 已持久化区间数组，每项 `{"start":…,"end":…}` 为**闭区间**（起止端点均含）；可乱序、重叠或相邻 |
+| `chunkBytes` | integer | 是   | 单次请求最大字节数，正安全整数（≥ 1）                         |
+| `limit`      | integer | 是   | 本次最多返回的请求条数，正安全整数，上限 10000                |
+
+校验严格（独立于 `/plan`，不做类型强转）：所有数值必须是安全整数——字符串
+`"1000"`、小数、负数、超过 `Number.MAX_SAFE_INTEGER` 的值一律 `400`；区间需
+满足 `0 ≤ start ≤ end < size`；`completed` 最多 10000 项；不允许多余字段。
+
+响应（`200`）字段：
+
+| 字段             | 说明                                                         |
+| ---------------- | ------------------------------------------------------------ |
+| `completedBytes` | 归并后的已完成字节数（重叠部分不重复计算）                    |
+| `remainingBytes` | 尚缺字节数（`size − completedBytes`）                         |
+| `hasMore`        | 本次返回的请求未覆盖全部缺口时为 `true`，可再次调用继续规划   |
+| `requestsCount`  | 本次返回的请求条数                                            |
+| `requests[]`     | 每条含 `index`、`start`/`end`（闭区间起止偏移）、`bytes`、`rangeHeader`（可直接用作 `Range` 请求头值，如 `bytes=300-549`） |
+
+空资源（`size: 0`）和已完整下载的资源都返回空 `requests`、`remainingBytes: 0`、
+`hasMore: false`。
+
+示例：
+
+```bash
+# 已持久化 [0,299]，每次最多 250 字节，本次取 2 条
+curl -X POST http://localhost:3000/resume-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"size":1000,"completed":[{"start":0,"end":299}],"chunkBytes":250,"limit":2}'
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "resource": { "size": 1000 },
+  "completedBytes": 300,
+  "remainingBytes": 700,
+  "hasMore": true,
+  "requestsCount": 2,
+  "requests": [
+    { "index": 1, "start": 300, "end": 549, "bytes": 250, "rangeHeader": "bytes=300-549" },
+    { "index": 2, "start": 550, "end": 799, "bytes": 250, "rangeHeader": "bytes=550-799" }
+  ]
+}
+```
+
+`hasMore: true` 表示仍有缺口未列出；把新完成的区间并入 `completed` 后再次
+调用即可取得后续分片，直到 `hasMore: false`。区间归并示例：上报
+`[{"start":40,"end":59},{"start":10,"end":19},{"start":30,"end":49},{"start":0,"end":9}]`
+会归并为 `[0,19]` 与 `[30,59]` 再计算缺口。
 
 ## 响应语义
 
@@ -244,19 +311,21 @@ PORT=8080 docker compose up --build -d   # 或编辑 compose 中的 ports 映射
 src/
   conditional.js # If-Range 评估：强 ETag 逐字比较、严格 HTTP-date 解析（IMF-fixdate/RFC 850/asctime）
   planner.js     # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
-  app.js         # Fastify 应用：POST/GET /plan、/healthz、输入校验
+  resume.js      # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
+  app.js         # Fastify 应用：POST/GET /plan、POST /resume-plan、/healthz、输入校验
   server.js      # 启动入口与环境变量读取
 test/
   planner.test.js  # 原有 node:test 用例（26 个）
   if-range.test.js # If-Range ETag/日期（含旧式日期格式）/降级/元数据校验用例（34 个）
   headers.test.js  # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
+  resume.test.js   # 断点续传缺口规划用例（24 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 64 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF
+npm test          # 88 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划
 npm start
 ```
 
@@ -274,3 +343,6 @@ npm start
   200 完整规划（`condition.reason: "invalid-validator"`）。
 - `contentType` 需为合法媒体类型且不含 CR/LF，杜绝响应头注入。
 - 所有偏移量使用非负安全整数（`Number.MAX_SAFE_INTEGER` 以内）解析。
+- `/resume-plan` 使用独立的严格校验器：关闭类型强转与属性剔除，字符串数字、
+  小数、多余字段一律 `400`；区间必须满足 `0 ≤ start ≤ end < size`，
+  `completed` 上限 10000 项、`limit` 上限 10000 条，防止超大输入耗尽资源。
