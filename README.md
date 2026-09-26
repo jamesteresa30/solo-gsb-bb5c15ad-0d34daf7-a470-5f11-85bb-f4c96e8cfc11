@@ -125,6 +125,64 @@ curl 'http://localhost:3000/plan?size=10000&lastModified=Wednesday,%2021-Oct-15%
   -H 'Range: bytes=0-99'
 ```
 
+### `POST /resume-plan`（断点续传缺口规划）
+
+根据已持久化的下载进度，规划补齐资源剩余字节所需的 `Range` 请求列表。
+服务同样不传输内容，只返回“还应该请求哪些字节”。
+
+请求体：
+
+| 字段          | 类型    | 必填 | 说明                                             |
+| ------------- | ------- | ---- | ------------------------------------------------ |
+| `size`        | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                 |
+| `completed`   | array   | 是   | 已持久化的闭区间 `[{start, end}]`（两端均含），允许乱序、重叠或相邻 |
+| `chunkBytes`  | integer | 是   | 单次请求最大字节数，正安全整数（≥ 1）             |
+| `limit`       | integer | 是   | 本次最多返回的请求条数，正安全整数（≥ 1）         |
+
+处理规则：
+
+- **严格校验**：所有数值必须是安全整数（`Number.MAX_SAFE_INTEGER` 以内）；
+  每个区间必须满足 `0 ≤ start ≤ end` 且 `end < size`，否则
+  `400 INVALID_INTERVAL`；字段缺失/类型错误返回 400（JSON Schema 校验）。
+- **归并**：`completed` 先按偏移排序，重叠或相邻（间隔为 0）的区间合并，
+  保证每字节只计一次；归并结果在响应的 `mergedCompleted` 中原样返回。
+- **缺口拆分**：缺失字节按偏移升序拆成不超过 `chunkBytes` 的请求，最多返回
+  `limit` 条；每条给出 `range`（可直接用作 `Range` 请求头的值）及
+  `start`/`end`/`bytes`。
+- **统计**：`completedBytes`（已完成字节数）、`remainingBytes`（剩余字节数）、
+  `totalRequests`（补完所需的总请求数）、`hasMore`（是否还有未返回的请求，
+  即 `totalRequests > limit`）。
+- **空资源 / 已完成**：`size: 0` 或 `completed` 已覆盖整个资源时，
+  `requests` 为空、`remainingBytes` 为 0、`hasMore: false`。
+
+```bash
+# 已下载 0-249 与 500-599（乱序、重叠、相邻提交也无妨），每次最多 100 字节，要 3 条
+curl -X POST http://localhost:3000/resume-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"size":1000,"completed":[{"start":500,"end":599},{"start":150,"end":249},{"start":0,"end":99},{"start":100,"end":199}],"chunkBytes":100,"limit":3}'
+```
+
+响应示例：
+
+```json
+{
+  "statusCode": 200,
+  "requests": [
+    { "start": 250, "end": 349, "bytes": 100, "range": "bytes=250-349" },
+    { "start": 350, "end": 449, "bytes": 100, "range": "bytes=350-449" },
+    { "start": 450, "end": 499, "bytes": 50,  "range": "bytes=450-499" }
+  ],
+  "totalRequests": 7,
+  "mergedCompleted": [{ "start": 0, "end": 249 }, { "start": 500, "end": 599 }],
+  "completedBytes": 350,
+  "remainingBytes": 650,
+  "hasMore": true
+}
+```
+
+客户端可循环调用：把每次成功持久化的区间并入 `completed` 再请求下一批，
+直到 `remainingBytes` 为 0。
+
 ## 响应语义
 
 每个规划结果带 `decision` 字段：
@@ -244,19 +302,21 @@ PORT=8080 docker compose up --build -d   # 或编辑 compose 中的 ports 映射
 src/
   conditional.js # If-Range 评估：强 ETag 逐字比较、严格 HTTP-date 解析（IMF-fixdate/RFC 850/asctime）
   planner.js     # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
-  app.js         # Fastify 应用：POST/GET /plan、/healthz、输入校验
+  resume.js      # 断点续传规划：区间归并、缺口计算、chunk 拆分、limit 截断
+  app.js         # Fastify 应用：POST/GET /plan、POST /resume-plan、/healthz、输入校验
   server.js      # 启动入口与环境变量读取
 test/
   planner.test.js  # 原有 node:test 用例（26 个）
   if-range.test.js # If-Range ETag/日期（含旧式日期格式）/降级/元数据校验用例（34 个）
   headers.test.js  # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
+  resume.test.js   # /resume-plan 归并/拆分/limit/边界与校验用例（20 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 64 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF
+npm test          # 84 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 断点续传规划
 npm start
 ```
 
@@ -274,3 +334,6 @@ npm start
   200 完整规划（`condition.reason: "invalid-validator"`）。
 - `contentType` 需为合法媒体类型且不含 CR/LF，杜绝响应头注入。
 - 所有偏移量使用非负安全整数（`Number.MAX_SAFE_INTEGER` 以内）解析。
+- `/resume-plan` 的 `size`/`chunkBytes`/`limit` 与每个 `completed` 区间的
+  `start`/`end` 都必须是安全整数；`start > end` 或 `end >= size` 的区间
+  一律 `400 INVALID_INTERVAL`，绝不静默截断。

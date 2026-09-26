@@ -4,6 +4,7 @@ import {
   DEFAULT_MAX_SEGMENTS,
   DEFAULT_TRANSFER_SIZE_RATIO,
 } from './planner.js';
+import { planResume } from './resume.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -23,6 +24,29 @@ const planBodySchema = {
 
 const MAX_HEADER_LENGTH = 4096;
 const MAX_METADATA_LENGTH = { etag: 1024, lastModified: 255 };
+
+// integer + [0, MAX_SAFE_INTEGER] bounds together enforce safe integers.
+const safeOffset = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
+
+const resumePlanBodySchema = {
+  type: 'object',
+  required: ['size', 'completed', 'chunkBytes', 'limit'],
+  additionalProperties: false,
+  properties: {
+    size: safeOffset,
+    completed: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['start', 'end'],
+        additionalProperties: false,
+        properties: { start: safeOffset, end: safeOffset },
+      },
+    },
+    chunkBytes: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+    limit: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
 
 export function buildApp(config = {}) {
   const app = Fastify({
@@ -75,6 +99,13 @@ export function buildApp(config = {}) {
       ifRange: request.headers['if-range'],
     });
 
+    return reply.status(result.statusCode).send(result);
+  });
+
+  // Resumable-download planner: POST /resume-plan with the persisted closed
+  // intervals; returns the missing bytes as a bounded list of Range requests.
+  app.post('/resume-plan', { schema: { body: resumePlanBodySchema } }, async (request, reply) => {
+    const result = planResume(request.body);
     return reply.status(result.statusCode).send(result);
   });
 
